@@ -1,0 +1,779 @@
+"""
+AI Image Generator with Database-based API Key Management
+Generates images using Bytez API with MongoDB for key management and storage
+"""
+
+from bytez import Bytez
+from pymongo import MongoClient
+from datetime import datetime, timezone
+import re
+import time
+import uuid
+import sys
+import os
+from api_key_manager import ApiKeyManager
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ==================== CONFIGURATION ====================
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+DB_NAME = os.getenv('DB_NAME', 'auto_image_generator')
+BYTEZ_KEYS_DB_NAME = os.getenv('BYTEZ_KEYS_DB_NAME', 'bytez_keys_manager')
+GENERATOR_NAME = os.getenv('GENERATOR_NAME', 'images-auto-generator')
+CHAT_UUID = os.getenv('CHAT_UUID', None)
+PROMPT_FILE_NAME = os.getenv('PROMPT_FILE_NAME', 'prompt.txt')  # Just filename, not path
+
+# File paths
+PROMPTS_DIR = 'prompts'
+PROMPT_FILE_PATH = os.path.join(PROMPTS_DIR, PROMPT_FILE_NAME)
+
+COLLECTION_IMAGES = "generated_images"
+COLLECTION_CHATS = "chats"
+COLLECTION_CHAT_MESSAGES = "chat_messages"
+
+# Chat History Management Configuration
+ENABLE_HISTORY_TRIMMING = True   # Set to True to enable auto-trimming
+MAX_HISTORY_MESSAGES = 400       # Keep last 200 conversations (400 messages)
+MAX_TOKENS_LIMIT = 260000        # GPT-5.1 safe limit (260K with buffer)
+
+"""
+✅ UPDATED Token Limits (Based on Actual Testing):
+- GPT-5.1 via Bytez: 272,000 tokens (ACTUAL LIMIT)
+- Configured Limit: 260,000 tokens (SAFE BUFFER)
+- Safety Buffer: 12,000 tokens (4.4% headroom)
+
+Model Token Limits Reference:
+- GPT-3.5-Turbo: 4,096 tokens
+- GPT-4: 8,192 tokens  
+- GPT-4-32K: 32,768 tokens
+- GPT-4-Turbo: 128,000 tokens
+- GPT-5.1: 272,000 tokens (CONFIRMED)
+- Claude 2: 100,000 tokens
+- Claude 3: 200,000 tokens
+
+Recommended MAX_HISTORY_MESSAGES based on model:
+- GPT-3.5: 20-40 messages
+- GPT-4: 40-80 messages
+- GPT-4-32K: 150-200 messages
+- GPT-5.1: 400-500 messages
+
+Note: Each message in this app is ~500 tokens (due to detailed prompts)
+So 400 messages = 200 conversations ≈ 200,000 tokens
+"""
+# ======================================================
+
+# Create directories if they don't exist
+os.makedirs(PROMPTS_DIR, exist_ok=True)
+
+# Initialize MongoDB
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client[DB_NAME]
+images_collection = db[COLLECTION_IMAGES]
+chats_collection = db[COLLECTION_CHATS]
+messages_collection = db[COLLECTION_CHAT_MESSAGES]
+
+
+def get_current_time():
+    """Get current UTC time in ISO format"""
+    return datetime.now(timezone.utc)
+
+
+def estimate_tokens(text):
+    """
+    Rough estimation of tokens
+    Rule of thumb: 1 token ≈ 4 characters in English
+    More accurate: 1 token ≈ 0.75 words
+    """
+    if not text:
+        return 0
+    
+    # Method 1: Character-based (conservative)
+    char_based = len(text) // 4
+    
+    # Method 2: Word-based (more accurate for English)
+    word_based = int(len(text.split()) * 1.3)
+    
+    # Use the higher estimate for safety
+    return max(char_based, word_based)
+
+
+def trim_chat_history(chat_history, system_prompt):
+    """
+    Trim chat history to prevent token limit errors
+    Keeps only the most recent conversations
+    Only active if ENABLE_HISTORY_TRIMMING is True
+    """
+    if not ENABLE_HISTORY_TRIMMING:
+        print(f"📊 Chat history trimming: DISABLED")
+        print(f"📊 Using full history: {len(chat_history)} messages")
+        return chat_history
+    
+    if not chat_history:
+        return chat_history
+    
+    # Calculate total estimated tokens
+    total_tokens = estimate_tokens(system_prompt)
+    for msg in chat_history:
+        total_tokens += estimate_tokens(msg.get('content', ''))
+    
+    print(f"📊 Chat history: {len(chat_history)} messages, ~{total_tokens:,} tokens")
+    
+    # If under limit and message count is reasonable, return as is
+    if total_tokens < MAX_TOKENS_LIMIT and len(chat_history) <= MAX_HISTORY_MESSAGES:
+        print(f"✅ Within limits (Max: {MAX_HISTORY_MESSAGES} messages, {MAX_TOKENS_LIMIT:,} tokens)")
+        return chat_history
+    
+    # Trim to last N messages (keep pairs of user+assistant)
+    trimmed_history = chat_history[-MAX_HISTORY_MESSAGES:]
+    
+    # Ensure we start with a user message
+    if trimmed_history and trimmed_history[0].get('role') == 'assistant':
+        trimmed_history = trimmed_history[1:]
+    
+    # Recalculate tokens after trimming
+    trimmed_tokens = estimate_tokens(system_prompt)
+    for msg in trimmed_history:
+        trimmed_tokens += estimate_tokens(msg.get('content', ''))
+    
+    print(f"✂️ TRIMMED: {len(chat_history)} → {len(trimmed_history)} messages")
+    print(f"📊 Tokens: {total_tokens:,} → {trimmed_tokens:,} (Limit: {MAX_TOKENS_LIMIT:,})")
+    
+    # If still over limit, trim more aggressively
+    if trimmed_tokens > MAX_TOKENS_LIMIT:
+        print(f"⚠️ Still over limit! Trimming more aggressively...")
+        
+        # Remove messages until under limit
+        while trimmed_tokens > MAX_TOKENS_LIMIT and len(trimmed_history) > 10:
+            # Remove oldest pair (user + assistant)
+            if len(trimmed_history) >= 2:
+                removed_user = trimmed_history.pop(0)
+                removed_assistant = trimmed_history.pop(0) if trimmed_history else None
+                
+                trimmed_tokens -= estimate_tokens(removed_user.get('content', ''))
+                if removed_assistant:
+                    trimmed_tokens -= estimate_tokens(removed_assistant.get('content', ''))
+        
+        print(f"✅ Final: {len(trimmed_history)} messages, ~{trimmed_tokens:,} tokens")
+    
+    return trimmed_history
+
+
+
+
+
+def load_prompt(prompt_file=None):
+    """
+    Load system prompt from file in /prompts directory
+    Uses PROMPT_FILE_NAME from config by default
+    """
+    try:
+        # Use provided file or fall back to config
+        file_name = prompt_file or PROMPT_FILE_NAME
+        file_path = os.path.join(PROMPTS_DIR, file_name)
+        
+        # Check if prompts directory exists
+        if not os.path.exists(PROMPTS_DIR):
+            print(f"❌ Error: '{PROMPTS_DIR}/' directory not found!")
+            print(f"💡 Creating '{PROMPTS_DIR}/' directory...")
+            os.makedirs(PROMPTS_DIR, exist_ok=True)
+            return None
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            print(f"❌ Error: Prompt file '{file_path}' not found!")
+            print(f"💡 Available prompts in '{PROMPTS_DIR}/':")
+            
+            prompt_files = [f for f in os.listdir(PROMPTS_DIR) if f.endswith('.txt')]
+            if prompt_files:
+                for f in prompt_files:
+                    print(f"   - {f}")
+            else:
+                print(f"   (No .txt files found)")
+                print(f"💡 Please create '{file_path}' with your prompt")
+            
+            return None
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            prompt_content = f.read().strip()
+        
+        print(f"✅ Loaded prompt from: {file_path}")
+        print(f"📏 Prompt length: {len(prompt_content)} characters (~{estimate_tokens(prompt_content)} tokens)")
+        
+        return prompt_content
+        
+    except Exception as e:
+        print(f"❌ Error reading prompt file '{file_path}': {e}")
+        return None
+
+
+def get_or_create_chat(chat_uuid=None, chat_title=None):
+    """Get existing chat or create new one"""
+    try:
+        # If chat_uuid provided, try to find it
+        if chat_uuid:
+            existing_chat = chats_collection.find_one({"chat_uuid": chat_uuid})
+            if existing_chat:
+                print(f"✅ Found existing chat: {existing_chat['title']} ({chat_uuid})")
+                chats_collection.update_one(
+                    {"chat_uuid": chat_uuid},
+                    {"$set": {"updatedAt": get_current_time()}}
+                )
+                return chat_uuid, existing_chat['title']
+            else:
+                print(f"⚠️ Chat UUID {chat_uuid} not found in database")
+        
+        # Create new chat
+        new_chat_uuid = str(uuid.uuid4())
+        
+        # Set default title if not provided
+        if not chat_title:
+            # Auto-generate title from prompt file name
+            prompt_base = os.path.splitext(PROMPT_FILE_NAME)[0]  # Remove .txt
+            chat_title = os.getenv('CHAT_TITLE', f'Chat - {prompt_base}')
+        
+        now = get_current_time()
+        chat_document = {
+            "chat_uuid": new_chat_uuid,
+            "title": chat_title,
+            "prompt_file": PROMPT_FILE_NAME,  # Store which prompt was used
+            "createdAt": now,
+            "updatedAt": now
+        }
+        
+        chats_collection.insert_one(chat_document)
+        print(f"✅ Created new chat: {chat_title} ({new_chat_uuid})")
+        print(f"📄 Using prompt file: {PROMPT_FILE_NAME}")
+        
+        return new_chat_uuid, chat_title
+        
+    except Exception as e:
+        print(f"❌ Error in get_or_create_chat: {e}")
+        return None, None
+
+
+def load_chat_history(chat_uuid, limit=None):
+    """
+    Load chat messages from database
+    If ENABLE_HISTORY_TRIMMING is True and no limit specified, 
+    only load recent messages to save memory
+    """
+    try:
+        query = {"chat_uuid": chat_uuid}
+        
+        # Determine limit
+        effective_limit = limit
+        if effective_limit is None and ENABLE_HISTORY_TRIMMING:
+            # Load slightly more than MAX to account for trimming
+            effective_limit = MAX_HISTORY_MESSAGES + 20
+        
+        if effective_limit:
+            # Get total count
+            total_count = messages_collection.count_documents(query)
+            skip_count = max(0, total_count - effective_limit)
+            
+            messages = messages_collection.find(query).sort("createdAt", 1).skip(skip_count)
+            
+            if total_count > effective_limit:
+                print(f"📊 Loading last {effective_limit} of {total_count} chat messages from DB")
+            else:
+                print(f"📊 Loading all {total_count} chat messages from DB")
+        else:
+            messages = messages_collection.find(query).sort("createdAt", 1)
+            total_count = messages_collection.count_documents(query)
+            print(f"📊 Loading all {total_count} chat messages from DB")
+        
+        chat_history = []
+        for msg in messages:
+            # Add user message
+            chat_history.append({
+                "role": "user",
+                "content": msg["message"]
+            })
+            # Add assistant response
+            chat_history.append({
+                "role": "assistant",
+                "content": msg["response"]
+            })
+        
+        print(f"✅ Loaded {len(chat_history)} messages into memory")
+        return chat_history
+        
+    except Exception as e:
+        print(f"❌ Error loading chat history: {e}")
+        return []
+
+
+def save_chat_message(chat_uuid, message, response, api_key):
+    """Save chat message to database"""
+    try:
+        now = get_current_time()
+        message_document = {
+            "chat_uuid": chat_uuid,
+            "message": message,
+            "response": response,
+            "api_key": api_key,
+            "createdAt": now,
+            "updatedAt": now
+        }
+        
+        result = messages_collection.insert_one(message_document)
+        
+        # Update chat's updatedAt
+        chats_collection.update_one(
+            {"chat_uuid": chat_uuid},
+            {"$set": {"updatedAt": now}}
+        )
+        
+        return result.inserted_id
+        
+    except Exception as e:
+        print(f"❌ Error saving chat message: {e}")
+        return None
+
+
+def delete_chat_message(message_id):
+    """Delete chat message from database"""
+    try:
+        if message_id:
+            result = messages_collection.delete_one({"_id": message_id})
+            if result.deleted_count > 0:
+                print(f"🗑️ Deleted orphaned chat message: {message_id}")
+                return True
+        return False
+    except Exception as e:
+        print(f"❌ Error deleting chat message: {e}")
+        return False
+
+
+def extract_info(response_text):
+    """Extract metadata using markers"""
+    try:
+        def get_marker_content(text, marker):
+            pattern = rf'\[@{marker}-start\](.*?)\[@{marker}-end\]'
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            return match.group(1).strip() if match else None
+        
+        extracted = {
+            "prompt": get_marker_content(response_text, "prompt"),
+            "title": get_marker_content(response_text, "title"),
+            "category": get_marker_content(response_text, "category"),
+            "description": get_marker_content(response_text, "description"),
+            "keywords": get_marker_content(response_text, "keywords")
+        }
+        
+        # Convert keywords to list
+        if extracted["keywords"]:
+            extracted["keywords"] = [k.strip() for k in extracted["keywords"].split(",")]
+        
+        return extracted
+    except Exception as e:
+        print(f"❌ Error extracting info: {e}")
+        return {
+            "prompt": None,
+            "title": None,
+            "category": None,
+            "description": None,
+            "keywords": []
+        }
+
+
+def generate_metadata(chat_uuid, chat_history, api_key_manager):
+    """Generate metadata using AI with chat history and database key management"""
+    model_name = "openai/gpt-5.1"
+    generator_type = "text"
+    api_key_id = None
+    api_key = None
+    
+    try:
+        print("🤖 Generating metadata...")
+        
+        system_prompt = load_prompt()
+        if not system_prompt:
+            return None, "Failed to load prompt", chat_history, None, None
+        
+        # Trim chat history BEFORE sending to API
+        trimmed_history = trim_chat_history(chat_history, system_prompt)
+        
+        # Retry loop for key acquisition and generation
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Acquire key from database
+                api_key_id, api_key = api_key_manager.acquire_key(model_name, generator_type)
+                
+                if not api_key:
+                    print("❌ No available chat API keys!")
+                    return None, "No available chat API keys", chat_history, None, None
+                
+                sdk = Bytez(api_key)
+                chat_model = sdk.model(model_name)
+                
+                # Build messages based on chat history
+                user_message = ""
+                if not trimmed_history:  # First generation
+                    print("📝 First generation - sending full prompt")
+                    user_message = system_prompt
+                    trimmed_history.append({"role": "user", "content": user_message})
+                else:  # Continue conversation
+                    print("🔄 Continuing conversation - requesting new generation")
+                    user_message = "Give me a new one"
+                    trimmed_history.append({"role": "user", "content": user_message})
+                
+                # Send trimmed history to API
+                output, error, _ = chat_model.run(trimmed_history)
+                
+                if error:
+                    print(f"❌ Error with key: {error}")
+                    
+                    # Log failed usage
+                    used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                    api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, False, str(error))
+                    
+                    # Detect token limit error and force aggressive trimming
+                    if "tokens exceed" in str(error).lower() or "token limit" in str(error).lower():
+                        print(f"⚠️ TOKEN LIMIT HIT! Forcing aggressive history trim...")
+                        
+                        # Aggressively trim to 50% of max
+                        aggressive_limit = MAX_HISTORY_MESSAGES // 2
+                        chat_history = chat_history[-aggressive_limit:]
+                        
+                        print(f"✂️ EMERGENCY TRIM: Reduced to {len(chat_history)} messages")
+                        
+                        # Remove the failed message
+                        trimmed_history.pop()
+                        
+                        # Release key and retry
+                        api_key_manager.release_key(api_key)
+                        continue
+                    
+                    # Regular error - mark expired and release, then retry
+                    trimmed_history.pop()
+                    api_key_manager.mark_key_expired_and_release(api_key, model_name)
+                    continue
+                
+                # Success - extract content
+                content = output.get('content', '') if isinstance(output, dict) else str(output)
+                print(f"✅ Generated metadata successfully")
+                
+                # Add assistant response to trimmed history
+                trimmed_history.append({"role": "assistant", "content": content})
+                
+                # Also add to original chat_history for continuity
+                if not chat_history or chat_history[-1].get('content') != user_message:
+                    chat_history.append({"role": "user", "content": user_message})
+                chat_history.append({"role": "assistant", "content": content})
+                
+                # Save to database and get message_id
+                message_id = save_chat_message(chat_uuid, user_message, content, api_key)
+                
+                metadata = extract_info(content)
+                
+                # Validate extraction
+                if not all([metadata.get('prompt'), metadata.get('title')]):
+                    print("⚠️ Extraction failed")
+                    delete_chat_message(message_id)
+                    if trimmed_history and len(trimmed_history) >= 2:
+                        trimmed_history.pop()
+                        trimmed_history.pop()
+                    if chat_history and len(chat_history) >= 2:
+                        chat_history.pop()
+                        chat_history.pop()
+                    
+                    # Log failed usage and release key
+                    used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                    api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, False, "Extraction failed")
+                    api_key_manager.release_key(api_key)
+                    
+                    return None, "Extraction failed", chat_history, None, None
+                
+                # Log successful usage
+                used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, True, None)
+                
+                # Release key
+                api_key_manager.release_key(api_key)
+                
+                return metadata, None, chat_history, message_id, api_key
+                
+            except Exception as e:
+                print(f"❌ Exception during generation: {e}")
+                if trimmed_history and trimmed_history[-1].get('role') == 'user':
+                    trimmed_history.pop()
+                
+                # Log and release key if acquired
+                if api_key:
+                    used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                    api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, False, str(e))
+                    api_key_manager.release_key(api_key)
+                
+                continue
+        
+        # All retries failed
+        print("❌ All retry attempts failed!")
+        return None, "All retry attempts exhausted", chat_history, None, None
+        
+    except Exception as e:
+        print(f"❌ Unexpected error in generate_metadata: {e}")
+        # Release key if acquired
+        if api_key:
+            api_key_manager.release_key(api_key)
+        return None, str(e), chat_history, None, None
+
+
+def generate_image(prompt, api_key_manager):
+    """Generate image using Imagen with database key management"""
+    model_name = "google/imagen-4.0-ultra-generate-001"
+    generator_type = "image"
+    api_key_id = None
+    api_key = None
+    
+    try:
+        print(f"🎨 Generating image...")
+        
+        # Retry loop for key acquisition and generation
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Acquire key from database
+                api_key_id, api_key = api_key_manager.acquire_key(model_name, generator_type)
+                
+                if not api_key:
+                    print("❌ No available image API keys!")
+                    return None, "No available image API keys", None
+                
+                sdk = Bytez(api_key)
+                image_model = sdk.model(model_name)
+                
+                image_link, error, _ = image_model.run(prompt)
+                
+                if error:
+                    print(f"❌ Error with key: {error}")
+                    
+                    # Log failed usage
+                    used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                    api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, False, str(error))
+                    
+                    # Mark expired and release, then retry
+                    api_key_manager.mark_key_expired_and_release(api_key, model_name)
+                    continue
+                
+                print(f"✅ Image generated: {image_link}")
+                
+                # Log successful usage
+                used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, True, None)
+                
+                # Release key
+                api_key_manager.release_key(api_key)
+                
+                return image_link, None, api_key
+                
+            except Exception as e:
+                print(f"❌ Exception during generation: {e}")
+                
+                # Log and release key if acquired
+                if api_key:
+                    used_by = f"{api_key_manager.generator_name} - {generator_type} generation"
+                    api_key_manager.log_usage(api_key_id, api_key, used_by, model_name, False, str(e))
+                    api_key_manager.release_key(api_key)
+                
+                continue
+        
+        # All retries failed
+        print("❌ All retry attempts failed!")
+        return None, "All retry attempts exhausted", None
+        
+    except Exception as e:
+        print(f"❌ Unexpected error in generate_image: {e}")
+        # Release key if acquired
+        if api_key:
+            api_key_manager.release_key(api_key)
+        return None, str(e), None
+
+
+def save_to_db(data):
+    """Save to MongoDB"""
+    try:
+        print("💾 Saving image...")
+        result = images_collection.insert_one(data)
+        print(f"✅ Saved: {result.inserted_id}")
+        return result.inserted_id
+    except Exception as e:
+        print(f"❌ Error saving to DB: {e}")
+        return None
+
+
+def generate_infinite(retry_failed=True, delay=2, chat_uuid=None, chat_title=None):
+    """Generate images indefinitely until user stops with Ctrl+C"""
+    api_key_manager = None
+    
+    try:
+        # Initialize API Key Manager
+        api_key_manager = ApiKeyManager(GENERATOR_NAME)
+        
+        # Get or create chat
+        chat_uuid, chat_title = get_or_create_chat(chat_uuid, chat_title)
+        if not chat_uuid:
+            print("❌ Cannot proceed without chat!")
+            return []
+        
+        # Load chat history from database
+        chat_history = load_chat_history(chat_uuid)
+        
+        print(f"\n{'#'*60}")
+        print(f"♾️  INFINITE GENERATION MODE")
+        print(f"🔑 Generator: {GENERATOR_NAME}")
+        print(f"💬 Chat: {chat_title} ({chat_uuid})")
+        print(f"📄 Prompt File: {PROMPT_FILE_PATH}")
+        print(f"📝 History: {len(chat_history)} messages in memory")
+        print(f"⚙️  History Trimming: {'ENABLED' if ENABLE_HISTORY_TRIMMING else 'DISABLED'}")
+        if ENABLE_HISTORY_TRIMMING:
+            print(f"📊 Max Messages: {MAX_HISTORY_MESSAGES} | Max Tokens: {MAX_TOKENS_LIMIT:,}")
+        print(f"⚠️  Press Ctrl+C to stop")
+        print(f"{'#'*60}\n")
+        
+        results = []
+        failed_count = 0
+        image_count = 0
+        
+        while True:  # Infinite loop
+            try:
+                image_count += 1
+                print(f"\n{'='*60}")
+                print(f"--- Image #{image_count} ---")
+                print(f"{'='*60}\n")
+                
+                # Generate metadata
+                metadata, error, chat_history, message_id, chat_api_key = generate_metadata(
+                    chat_uuid, chat_history, api_key_manager
+                )
+                
+                if not metadata or not message_id:
+                    print(f"❌ #{image_count}. Metadata generation failed - continuing to next image")
+                    failed_count += 1
+                    time.sleep(delay)
+                    continue
+                
+                print(f"\n📊 Metadata:")
+                print(f"  Title: {metadata['title']}")
+                print(f"  Category: {metadata['category']}")
+                print(f"  Keywords: {metadata.get('keywords', [])}\n")
+                
+                # Generate image
+                image_link, error, image_api_key = generate_image(
+                    metadata["prompt"], api_key_manager
+                )
+                
+                if not image_link:
+                    print(f"❌ #{image_count}. Image generation failed - continuing to next image")
+                    delete_chat_message(message_id)
+                    if len(chat_history) >= 2:
+                        chat_history.pop()
+                        chat_history.pop()
+                    failed_count += 1
+                    time.sleep(delay)
+                    continue
+                
+                # Save to DB
+                now = get_current_time()
+                document = {
+                    "message_id": message_id,
+                    "prompt": metadata["prompt"],
+                    "title": metadata["title"],
+                    "category": metadata["category"],
+                    "description": metadata["description"],
+                    "keywords": metadata["keywords"],
+                    "image_link": image_link,
+                    "api_key": image_api_key,
+                    "prompt_file": PROMPT_FILE_NAME,
+                    "createdAt": now,
+                    "updatedAt": now
+                }
+                
+                if save_to_db(document):
+                    results.append(document)
+                    print(f"✅ #{image_count}. {metadata['title']}")
+                    failed_count = 0
+                else:
+                    print(f"⚠️ Failed to save to database")
+                    delete_chat_message(message_id)
+                    if len(chat_history) >= 2:
+                        chat_history.pop()
+                        chat_history.pop()
+                
+                time.sleep(delay)
+                    
+            except KeyboardInterrupt:
+                print("\n\n⏹️  Generation stopped by user (Ctrl+C)")
+                break
+            except Exception as e:
+                print(f"❌ Error in iteration #{image_count}: {e}")
+                failed_count += 1
+                time.sleep(delay)
+                continue
+        
+        print(f"\n{'#'*60}")
+        print(f"📊 Final Summary:")
+        print(f"  Generator: {GENERATOR_NAME}")
+        print(f"  Chat: {chat_title} ({chat_uuid})")
+        print(f"  Prompt File: {PROMPT_FILE_NAME}")
+        print(f"  Total Attempts: {image_count}")
+        print(f"  Successful: {len(results)}")
+        print(f"  Failed: {image_count - len(results)}")
+        print(f"  Final History Size: {len(chat_history)} messages")
+        print(f"{'#'*60}\n")
+        
+        if results:
+            print("\n🎨 Last 10 Generated Images:")
+            for i, result in enumerate(results[-10:], 1):
+                print(f"  {i}. [{result['category']}] {result['title']}")
+        
+        print(f"\n💡 To continue this chat, use: chat_uuid='{chat_uuid}'")
+        
+        return results
+        
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Generation stopped by user (Ctrl+C)")
+        return []
+    except Exception as e:
+        print(f"❌ Unexpected error in generate_infinite: {e}")
+        return []
+    finally:
+        # Cleanup: Release all keys on exit
+        if api_key_manager:
+            print("\n🧹 Cleaning up...")
+            api_key_manager.release_all_keys()
+
+
+if __name__ == "__main__":
+    try:
+        # Get config from environment
+        chat_uuid = os.getenv('CHAT_UUID', None)
+        chat_title = os.getenv('CHAT_TITLE', None)
+        
+        print(f"\n{'='*60}")
+        print(f"🚀 AI Image Generator Worker Started")
+        print(f"📍 Environment: {'Render' if os.getenv('RENDER') else 'Local'}")
+        print(f"� Generator: {GENERATOR_NAME}")
+        print(f"📁 Prompts Directory: {PROMPTS_DIR}/")
+        print(f"📄 Prompt File: {PROMPT_FILE_NAME}")
+        print(f"💬 Chat UUID: {chat_uuid or 'New Chat (will be created)'}")
+        if chat_title:
+            print(f"📝 Chat Title: {chat_title}")
+        print(f"{'='*60}\n")
+        
+        # Run infinite generation
+        generate_infinite(
+            chat_uuid=chat_uuid,
+            chat_title=chat_title,
+            delay=2
+        )
+        
+    except KeyboardInterrupt:
+        print("\n⏹️ Stopped by user")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()

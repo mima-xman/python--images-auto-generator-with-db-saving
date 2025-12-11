@@ -1,0 +1,274 @@
+"""
+API Key Manager for Database-based Key Management
+Handles acquisition, release, logging, and expiration tracking of API keys
+"""
+
+from pymongo import MongoClient
+from datetime import datetime, timezone, timedelta
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class ApiKeyManager:
+    """Manages API keys from MongoDB database"""
+    
+    def __init__(self, generator_name=None, mongodb_uri=None):
+        """
+        Initialize API Key Manager
+        
+        Args:
+            generator_name: Name of the generator (defaults to env GENERATOR_NAME or "images-auto-generator")
+            mongodb_uri: MongoDB URI for API keys (optional, falls back to BYTEZ_KEYS_MONGODB_URI then MONGODB_URI)
+        """
+        # MongoDB Configuration with fallback chain:
+        # 1. Provided mongodb_uri parameter
+        # 2. BYTEZ_KEYS_MONGODB_URI environment variable
+        # 3. MONGODB_URI environment variable
+        # 4. Default localhost
+        self.mongodb_uri = (
+            mongodb_uri or 
+            os.getenv('BYTEZ_KEYS_MONGODB_URI') or 
+            os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+        )
+        self.keys_db_name = os.getenv('BYTEZ_KEYS_DB_NAME', 'bytez_keys_manager')
+        self.generator_name = generator_name or os.getenv('GENERATOR_NAME', 'images-auto-generator')
+        
+        # Connect to MongoDB
+        self.mongo_client = MongoClient(self.mongodb_uri)
+        self.db = self.mongo_client[self.keys_db_name]
+        self.api_keys_collection = self.db['api_keys']
+        self.usage_logs_collection = self.db['key_usage_logs']
+        
+        print(f"✅ ApiKeyManager initialized: {self.generator_name}")
+        print(f"🔗 Keys MongoDB URI: {self.mongodb_uri[:50]}...")
+        print(f"📊 Keys Database: {self.keys_db_name}")
+    
+    @staticmethod
+    def sanitize_model_name(model_name):
+        r"""
+        Sanitize model name for use as MongoDB field key
+        Replaces /, \, . with __
+        
+        Args:
+            model_name: Original model name (e.g., "google/imagen-4.0-ultra-generate-001")
+            
+        Returns:
+            Sanitized model name (e.g., "google__imagen-4__0-ultra-generate-001")
+        """
+        return model_name.replace('/', '__').replace('\\', '__').replace('.', '__')
+    
+    def acquire_key(self, model_name, generator_type):
+        """
+        Acquire an available API key from database
+        
+        Args:
+            model_name: Model name (e.g., "openai/gpt-5.1")
+            generator_type: Type of generation ("text" or "image")
+            
+        Returns:
+            Tuple of (api_key_id, api_key_string) or (None, None) if no keys available
+        """
+        try:
+            sanitized_model = self.sanitize_model_name(model_name)
+            expiration_field = f"models_expirations.{sanitized_model}"
+            used_by_value = f"{self.generator_name} - {generator_type} generation"
+            
+            # Query for available keys
+            # Key must be: not in use AND (model not in expirations OR expired more than 24h ago)
+            query = {
+                "in_use": False,
+                "$or": [
+                    {expiration_field: {"$exists": False}},
+                    {expiration_field: {"$lte": datetime.now(timezone.utc) - timedelta(days=1)}}
+                ]
+            }
+            
+            # Update to lock the key and remove expiration field if exists
+            update = {
+                "$set": {
+                    "in_use": True,
+                    "used_by": used_by_value,
+                    "locked_at": datetime.now(timezone.utc),
+                },
+                "$unset": {
+                    expiration_field: ""
+                }
+            }
+            
+            # Find and update atomically
+            result = self.api_keys_collection.find_one_and_update(
+                query,
+                update,
+                return_document=True  # Return the updated document
+            )
+            
+            if result:
+                api_key_id = str(result['_id'])
+                api_key = result['api_key']
+                print(f"🔑 Acquired key: {api_key[:8]}... for {model_name} ({generator_type})")
+                return api_key_id, api_key
+            else:
+                print(f"❌ No available keys for {model_name} ({generator_type})")
+                return None, None
+                
+        except Exception as e:
+            print(f"❌ Error acquiring key: {e}")
+            return None, None
+    
+    def release_key(self, api_key):
+        """
+        Release a key back to the pool
+        
+        Args:
+            api_key: The API key string to release
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            update = {
+                "$set": {
+                    "in_use": False,
+                    "used_by": None,
+                    "locked_at": None
+                }
+            }
+            
+            result = self.api_keys_collection.update_one(
+                {"api_key": api_key},
+                update
+            )
+            
+            if result.modified_count > 0:
+                print(f"🔓 Released key: {api_key[:8]}...")
+                return True
+            else:
+                print(f"⚠️ Key not found or already released: {api_key[:8]}...")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error releasing key: {e}")
+            return False
+    
+    def log_usage(self, api_key_id, api_key, used_by, model_name, success, error=None):
+        """
+        Log API key usage to database
+        
+        Args:
+            api_key_id: The MongoDB ObjectId of the API key
+            api_key: The API key string
+            used_by: Who used the key (generator name + type)
+            model_name: Model name used
+            success: Whether the generation was successful
+            error: Error message if failed (optional)
+            
+        Returns:
+            Inserted log ID or None if failed
+        """
+        try:
+            log_document = {
+                "api_key_id": api_key_id,
+                "api_key": api_key,
+                "used_by": used_by,
+                "used_at": datetime.now(timezone.utc),
+                "model_name": model_name,
+                "success": success,
+                "error": error
+            }
+            
+            result = self.usage_logs_collection.insert_one(log_document)
+            
+            status = "✅" if success else "❌"
+            print(f"{status} Logged usage: {model_name} - {api_key[:8]}... - Success: {success}")
+            
+            return str(result.inserted_id)
+            
+        except Exception as e:
+            print(f"❌ Error logging usage: {e}")
+            return None
+    
+    def mark_key_expired_and_release(self, api_key, model_name):
+        """
+        Atomically mark a key as expired for a specific model AND release it
+        Single database operation for efficiency
+        
+        Args:
+            api_key: The API key string
+            model_name: Model name to mark as expired
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            sanitized_model = self.sanitize_model_name(model_name)
+            expiration_field = f"models_expirations.{sanitized_model}"
+            
+            # Single atomic update: mark expired AND release
+            update = {
+                "$set": {
+                    expiration_field: datetime.now(timezone.utc),
+                    "in_use": False,
+                    "used_by": None,
+                    "locked_at": None
+                }
+            }
+            
+            result = self.api_keys_collection.update_one(
+                {"api_key": api_key},
+                update
+            )
+            
+            if result.modified_count > 0:
+                print(f"⏰ Marked key as expired for {model_name} and released: {api_key[:8]}...")
+                return True
+            else:
+                print(f"⚠️ Key not found: {api_key[:8]}...")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error marking key expired: {e}")
+            return False
+    
+    def release_all_keys(self):
+        """
+        Release all keys currently locked by this generator
+        Useful for cleanup on shutdown
+        
+        Returns:
+            Number of keys released
+        """
+        try:
+            # Find all keys used by this generator
+            query = {
+                "in_use": True,
+                "used_by": {"$regex": f"^{self.generator_name}"}
+            }
+            
+            update = {
+                "$set": {
+                    "in_use": False,
+                    "used_by": None,
+                    "locked_at": None
+                }
+            }
+            
+            result = self.api_keys_collection.update_many(query, update)
+            
+            if result.modified_count > 0:
+                print(f"🔓 Released {result.modified_count} keys on cleanup")
+            
+            return result.modified_count
+            
+        except Exception as e:
+            print(f"❌ Error releasing all keys: {e}")
+            return 0
+    
+    def __del__(self):
+        """Cleanup: close MongoDB connection"""
+        try:
+            if hasattr(self, 'mongo_client'):
+                self.mongo_client.close()
+        except:
+            pass
